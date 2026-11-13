@@ -29,11 +29,21 @@ services:
       DB_PATH: "/data/collector.db"
       HISTORY_PAGE_SIZE: "50"
       SSE_READ_TIMEOUT: "60"
+      # 后台分批物理删除：每批 100 行，空闲轮询 1 秒（清理期间采集/查询不中断）
+      CLEANUP_BATCH_SIZE: "100"
+      CLEANUP_IDLE_INTERVAL: "1"
+      # 清理故障演练开关，正常运行保持 0；置为 1.0 可演示清理失败与自动续清
+      CLEANUP_FAIL_RATE: "0"
     volumes:
       - collector-data:/data
     depends_on:
       station:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8001/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
 volumes:
   collector-data:

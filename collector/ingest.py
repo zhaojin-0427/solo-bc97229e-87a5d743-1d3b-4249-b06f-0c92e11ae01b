@@ -20,6 +20,7 @@ from typing import Any
 import httpx
 
 from .db import (
+    ERROR_KIND_CLEANUP,
     ERROR_KIND_HISTORY,
     ERROR_KIND_PARSE,
     ERROR_KIND_SSE,
@@ -34,6 +35,11 @@ SSE_RECONNECT_BASE = float(os.getenv("SSE_RECONNECT_BASE", "0.5"))
 SSE_RECONNECT_MAX = float(os.getenv("SSE_RECONNECT_MAX", "30"))
 SSE_READ_TIMEOUT = float(os.getenv("SSE_READ_TIMEOUT", "60"))
 STATION_CATCHUP_IDLE = float(os.getenv("STATION_CATCHUP_IDLE", "0.5"))
+# 后台清理每批物理删除的行数与空闲轮询间隔
+CLEANUP_BATCH_SIZE = int(os.getenv("CLEANUP_BATCH_SIZE", "100"))
+CLEANUP_IDLE_INTERVAL = float(os.getenv("CLEANUP_IDLE_INTERVAL", "1.0"))
+# 故障演练开关：>0 时后台清理每批按该概率主动失败（默认关闭）
+CLEANUP_FAIL_RATE = float(os.getenv("CLEANUP_FAIL_RATE", "0.0"))
 
 META_HISTORY_CURSOR = "history_cursor"
 
@@ -79,6 +85,31 @@ class IngestEngine:
         self.max_seen_seq = 0
         self._backfill_open_error: int | None = None
         self._sse_open_error: int | None = None
+        self._cleanup_open_error: int | None = None
+        # 留存边界缓存：已受理的最大清理截止序号（权威值在 SQLite meta 中）。
+        # 已清理记录在内存层即被拦截，SQL 条件插入是兜底硬防护。
+        self.cleanup_boundary = 0
+        # 当前归档代际：与库内 epoch 一致时后台清理才允许动手
+        self.archive_epoch = 0
+        # 后台正在等待物理删除的行数（仅状态展示，权威计数以快照查询为准）
+        self.cleanup_pending = 0
+
+    async def refresh_cleanup_boundary(self) -> int:
+        """从数据库重新加载留存边界与代际（启动/受理/重置后调用）。"""
+        self.cleanup_boundary = await self.db.get_cleanup_boundary()
+        self.archive_epoch = await self.db.get_archive_epoch()
+        return self.cleanup_boundary
+
+    async def reconcile_cleanup_errors(self) -> None:
+        """启动/恢复时对账清理错误：若边界下已无待删明细，
+        历史未恢复的清理错误视为随恢复完成而关闭（重启后续清成功的场景）。"""
+        async with self.db.snapshot() as snap:
+            boundary = await snap.get_cleanup_boundary()
+            pending = await snap.count_pending_cleanup(boundary)
+            rows = await snap.list_errors(50, False, ERROR_KIND_CLEANUP)
+        if pending == 0:
+            for row in rows:
+                await self.db.resolve_error(row["id"])
 
     # ----------------------------- 生命周期 -----------------------------
 
@@ -87,10 +118,14 @@ class IngestEngine:
         cur = await self.db.conn.execute("SELECT COALESCE(MAX(seq), 0) m FROM positions")
         row = await cur.fetchone()
         self.max_seen_seq = row["m"]
+        # 重启恢复：边界/代际/待清状态都在 SQLite，后台清理自动续清
+        await self.refresh_cleanup_boundary()
+        await self.reconcile_cleanup_errors()
         self._stop.clear()
         self._tasks = [
             asyncio.create_task(self._sse_loop(), name="sse-loop"),
             asyncio.create_task(self._history_loop(), name="history-loop"),
+            asyncio.create_task(self._cleanup_loop(), name="cleanup-loop"),
         ]
 
     async def stop(self) -> None:
@@ -111,12 +146,20 @@ class IngestEngine:
         except (ValueError, TypeError, KeyError) as exc:
             await self.db.add_error(ERROR_KIND_PARSE, f"{source} 记录解析失败: {exc}")
             return False
-        inserted = await self.db.upsert_position(pos, source)
+        # 留存边界内存拦截：在途历史页、实时帧、回退补采送达的已清理序号
+        # 一律不重新入库（SQL 条件插入还会再兜底一次）
+        if pos["seq"] <= self.cleanup_boundary:
+            return False
+        inserted = await self.db.upsert_position(
+            pos, source, self.cleanup_boundary
+        )
         # SSE 侧代际检测：已入库的最大序号远大于当前序号（回退超过一个补采页），
-        # 且当前序号很小，判定岸站重置；回退历史游标重拉新一代际（去重仍安全）
+        # 且当前序号很小，判定岸站重置；回退历史游标重拉新一代际（去重仍安全）。
+        # 已清理序号造成的“回退”不算代际切换，避免误判。
         if (
             source == "sse"
             and not inserted
+            and pos["seq"] > self.cleanup_boundary
             and self.max_seen_seq - pos["seq"] > HISTORY_PAGE_SIZE
         ):
             cursor_now = int(await self.db.get_meta(META_HISTORY_CURSOR, "0"))
@@ -314,3 +357,68 @@ class IngestEngine:
                 else:
                     # 还有历史页，尽量连续拉取但让出事件循环
                     await asyncio.sleep(0)
+
+    # ----------------------------- 后台分批清理循环 -----------------------------
+
+    async def _cleanup_loop(self) -> None:
+        """按留存边界分批物理删除明细，期间采集与查询持续可用。
+
+        - 边界与待清理状态均持久化在 SQLite；失败/重启后本循环自动续清。
+        - 每批删除同时校验归档代际与当前边界：发生过清空重置（epoch 变化）
+          或边界回退时一条都不会删，旧清理不可能删除新归档。
+        - 逻辑排除在受理时即刻生效，物理删除只是回收空间，可慢可中断。
+        """
+        backoff = 1.0
+        while not self._stop.is_set():
+            try:
+                batch = await self.db.next_cleanup_batch(CLEANUP_BATCH_SIZE)
+                if batch is None:
+                    # 边界下已无物理行：清理处于健康状态，关闭历史未恢复错误，
+                    # 把受理申请标记完成，随后空闲轮询
+                    if self._cleanup_open_error is not None:
+                        await self.db.resolve_error(self._cleanup_open_error)
+                        self._cleanup_open_error = None
+                    await self.db.mark_cleanup_requests_done()
+                    self.cleanup_pending = 0
+                    backoff = 1.0
+                    try:
+                        await asyncio.wait_for(
+                            self._stop.wait(), timeout=CLEANUP_IDLE_INTERVAL
+                        )
+                    except asyncio.TimeoutError:
+                        pass
+                    continue
+                epoch, boundary, batch_max_seq = batch
+                if epoch != self.archive_epoch:
+                    # 库已进入新代际（重置后新归档）：同步代际并停手本批
+                    self.archive_epoch = epoch
+                    continue
+                if CLEANUP_FAIL_RATE > 0 and random.random() < CLEANUP_FAIL_RATE:
+                    raise RuntimeError(
+                        f"注入的清理批次故障 (fail_rate={CLEANUP_FAIL_RATE})"
+                    )
+                deleted = await self.db.delete_cleanup_batch(
+                    epoch, batch_max_seq
+                )
+                if self._cleanup_open_error is not None:
+                    await self.db.resolve_error(self._cleanup_open_error)
+                    self._cleanup_open_error = None
+                backoff = 1.0
+                # 待删量按本批实际删除量递减（仅展示用途）
+                self.cleanup_pending = max(0, self.cleanup_pending - deleted)
+                # 每批之间让出事件循环，避免长时间占用写连接
+                await asyncio.sleep(0)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if self._cleanup_open_error is None:
+                    self._cleanup_open_error = await self.db.add_error(
+                        ERROR_KIND_CLEANUP,
+                        f"后台清理批次失败: {type(exc).__name__}: {exc}",
+                    )
+                delay = min(backoff, 30.0) * (0.5 + random.random() * 0.5)
+                backoff = min(backoff * 2, 30.0)
+                try:
+                    await asyncio.wait_for(self._stop.wait(), timeout=delay)
+                except asyncio.TimeoutError:
+                    pass
